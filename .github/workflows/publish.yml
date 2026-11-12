@@ -47,7 +47,7 @@ jobs:
           RUN: ${{ steps.build.outputs.run }}
         run: |
           tag="archive-${RUN:0:6}"
-          tar -czf "gfs-${RUN}.tar.gz" -C _site v1
+          tar --exclude='v1/clouds' -czf "gfs-${RUN}.tar.gz" -C _site v1
           gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --title "Hint maps ${RUN:0:4}-${RUN:4:2}" \
             --notes "Every published run of the month, one archive per run (GFS run time in the file name)."
           gh release upload "$tag" "gfs-${RUN}.tar.gz" --clobber

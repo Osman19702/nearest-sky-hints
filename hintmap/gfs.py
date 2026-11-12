@@ -29,10 +29,13 @@ FREEZING_RAIN_FLAG = ("CFRZR", "surface")
 RAIN_FLAG = ("CRAIN", "surface")
 TEMPERATURE = ("TMP", "2 m above ground")
 TERRAIN_HEIGHT = ("HGT", "surface")
+TOTAL_CLOUD = ("TCDC", "entire atmosphere")
 HINT_FIELDS = [PRECIPITATION_RATE, CONVECTIVE_RATE, SNOW_FLAG, ICE_PELLET_FLAG, FREEZING_RAIN_FLAG, RAIN_FLAG, TEMPERATURE, TERRAIN_HEIGHT]
+# What the scheduled job publishes: the hint fields and the cloud cover for the app's map.
+LIVE_FIELDS = HINT_FIELDS + [TOTAL_CLOUD]
 # What each field is in GRIB2 terms (discipline, category, number): every decoded message is
 # checked against it, so an index that points at the wrong bytes cannot slip a wrong field in.
-CODES = {PRECIPITATION_RATE: (0, 1, 7), CONVECTIVE_RATE: (0, 1, 37), SNOW_FLAG: (0, 1, 195), ICE_PELLET_FLAG: (0, 1, 194),
+CODES = {TOTAL_CLOUD: (0, 6, 1), PRECIPITATION_RATE: (0, 1, 7), CONVECTIVE_RATE: (0, 1, 37), SNOW_FLAG: (0, 1, 195), ICE_PELLET_FLAG: (0, 1, 194),
          FREEZING_RAIN_FLAG: (0, 1, 193), RAIN_FLAG: (0, 1, 192), TEMPERATURE: (0, 0, 0), TERRAIN_HEIGHT: (0, 3, 5)}
 
 

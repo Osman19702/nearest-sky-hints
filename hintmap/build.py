@@ -3,7 +3,8 @@
     python3 -m hintmap.build live --site <folder> [--atlases atlases] [--status-url URL]
         The scheduled job: the newest complete GFS run, forecast hours +3 to +18, every atlas in
         `atlases/`, written as <site>/v1/<atlas>/<YYYYMMDDHH>.bin plus <site>/v1/status.json.
-        Exits 0 without building when `--status-url` already names that run (nothing new), and
+        Exits 0 without building when `--status-url` already names that run, with its cloud files
+        (nothing new), and
         with an error when the newest run is older than it should be or a map looks implausible,
         so that the published site stays as it is.
 
@@ -25,7 +26,7 @@ import sys
 import time
 import urllib.request
 
-from . import atlas, classify, gfs, hintfile
+from . import atlas, classify, cloudfile, gfs, hintfile
 
 SOURCE = "gfs0p25"
 FIRST_HOUR, LAST_HOUR = 3, 18
@@ -33,6 +34,8 @@ FIRST_HOUR, LAST_HOUR = 3, 18
 OLDEST_ACCEPTABLE_RUN_HOURS = 11
 # A map outside these shares of the places is not published (a decoding or data problem).
 MOST_RAIN_SHARE, MOST_SNOW_SHARE = 0.45, 0.35
+# Nor is a cloud layer whose global mean cover lies outside this range (the Earth's is about 65 %).
+CLOUD_MEAN_RANGE = (20.0, 90.0)
 UTC = datetime.timezone.utc
 
 
@@ -40,12 +43,15 @@ def log(message):
     print(message, flush=True)
 
 
-def cells_for(run, forecast_hour, atlases, hoods_by_atlas, cache_dir=None):
-    """{atlas name: cells} for one forecast hour of one run."""
-    fields = gfs.load_fields(run, forecast_hour, log=log, cache_dir=cache_dir)
+def cells_for(run, forecast_hour, atlases, hoods_by_atlas, cache_dir=None, fields=None):
+    """{atlas name: cells} for one forecast hour of one run. `fields` are the decoded messages of
+    that hour when the caller has them already."""
+    if fields is None:
+        fields = gfs.load_fields(run, forecast_hour, log=log, cache_dir=cache_dir)
     grid = classify.Grid.of(fields[gfs.TEMPERATURE])
     values = {}
-    for field, message in fields.items():
+    for field in gfs.HINT_FIELDS:
+        message = fields[field]
         if classify.Grid.of(message) != grid:
             raise ValueError("%s is on another grid" % field[0])
         values[field] = message.values()
@@ -78,6 +84,21 @@ def plausibility_problem(cells):
     return None
 
 
+def cloud_file(message, valid, run, generated):
+    """The bytes of the cloud file for one hour, and the problem with it if it looks wrong."""
+    grid = classify.Grid.of(message)
+    values, width, height = cloudfile.halve(message.values(), grid.ni, grid.nj)
+    cells = cloudfile.quantise(values)
+    known = [value for value in cells if value != cloudfile.NO_DATA]
+    mean = sum(known) / len(known) if known else 0.0
+    problem = None
+    if len(known) < len(cells) or not (CLOUD_MEAN_RANGE[0] <= mean <= CLOUD_MEAN_RANGE[1]):
+        problem = "cloud cover: mean %.0f %%, %d cells without data" % (mean, len(cells) - len(known))
+    data = cloudfile.encode(cells, width, height, grid.la1, grid.lo1, grid.dj * 2, grid.di * 2, calendar.timegm(valid.timetuple()),
+                            calendar.timegm(run.timetuple()), calendar.timegm(generated.timetuple()), SOURCE)
+    return data, problem, mean
+
+
 def stamp(moment):
     return moment.strftime("%Y-%m-%dT%H:%MZ")
 
@@ -91,14 +112,22 @@ def write_hint(path, places, cells, valid, run, generated):
                    calendar.timegm(generated.timetuple()), SOURCE)
 
 
-def published_run(status_url):
-    """The run the published site names, or None when it cannot be read."""
+def published_status(status_url):
+    """The published site's status.json, or None when it cannot be read."""
     try:
         request = urllib.request.Request(status_url, headers={"User-Agent": gfs.USER_AGENT, "Cache-Control": "no-cache"})
         with urllib.request.urlopen(request, timeout=20) as response:
-            return json.loads(response.read().decode("utf-8")).get("run")
+            status = json.loads(response.read().decode("utf-8"))
+            return status if isinstance(status, dict) else None
     except Exception:  # unreachable before the first deployment, or while DNS is being set up
         return None
+
+
+def already_published(status, run):
+    """True when the published site holds everything this builder makes for `run`. A site built
+    before the cloud files existed names the run but lists no cloud hours: it is rebuilt at once
+    rather than at the next run."""
+    return bool(status) and status.get("run") == stamp(run) and bool(status.get("clouds"))
 
 
 def set_output(name, value):
@@ -113,8 +142,9 @@ INDEX_HTML = """<!doctype html>
 <title>Nearest Sky weather hints</title></head>
 <body style="font: 16px/1.5 -apple-system, sans-serif; max-width: 40em; margin: 2em auto; padding: 0 1em">
 <h1>Nearest Sky weather hints</h1>
-<p>Hourly maps of where a weather model shows rain or snow at the places the Nearest Sky app knows.
-The app uses them only to decide where to look first; every result it shows is confirmed by Apple Weather.</p>
+<p>Hourly maps of where a weather model shows rain or snow at the places the Nearest Sky app knows,
+and of the model's cloud cover over the globe. The app uses the first only to decide where to look first
+(every result it shows is confirmed by Apple Weather) and draws the second on its map.</p>
 <p>Built from the NOAA/NCEP Global Forecast System (public domain). Place list derived from GeoNames (CC BY 4.0).
 Status: <a href="v1/status.json">v1/status.json</a>.</p>
 </body></html>
@@ -129,7 +159,7 @@ def live(arguments):
         return 1
     age = (now - run).total_seconds() / 3600.0
     log("newest complete run: %s (%.1f h old)" % (stamp(run), age))
-    if arguments.status_url and published_run(arguments.status_url) == stamp(run):
+    if arguments.status_url and already_published(published_status(arguments.status_url), run):
         log("that run is already published")
         set_output("changed", "false")
         return 0
@@ -145,7 +175,16 @@ def live(arguments):
     hours = []
     for forecast_hour in range(FIRST_HOUR, LAST_HOUR + 1):
         valid = run + datetime.timedelta(hours=forecast_hour)
-        cells_by_atlas = cells_for(run, forecast_hour, atlases, hoods)
+        fields = gfs.load_fields(run, forecast_hour, fields=gfs.LIVE_FIELDS, log=log)
+        clouds, problem, mean_cover = cloud_file(fields[gfs.TOTAL_CLOUD], valid, run, generated)
+        if problem:
+            log("%s for %s: %s; not publishing" % (stamp(valid), stamp(run), problem))
+            return 1
+        cloud_folder = os.path.join(arguments.site, "v1", "clouds")
+        os.makedirs(cloud_folder, exist_ok=True)
+        with open(os.path.join(cloud_folder, file_name(valid)), "wb") as out:
+            out.write(clouds)
+        cells_by_atlas = cells_for(run, forecast_hour, atlases, hoods, fields=fields)
         for name, places in atlases:
             cells = cells_by_atlas[name]
             problem = plausibility_problem(cells)
@@ -156,11 +195,12 @@ def live(arguments):
             os.makedirs(folder, exist_ok=True)
             write_hint(os.path.join(folder, file_name(valid)), places, cells, valid, run, generated)
         counts = classify.summary(cells_by_atlas[atlases[0][0]])
-        log("  %s: rain %d, snow %d, mixed %d, freezing %d" % (stamp(valid), counts.get(hintfile.RAIN, 0), counts.get(hintfile.SNOW, 0),
-                                                             counts.get(hintfile.MIXED, 0), counts.get(hintfile.FREEZING_RAIN, 0)))
+        log("  %s: rain %d, snow %d, mixed %d, freezing %d, mean cloud cover %.0f %%" % (
+            stamp(valid), counts.get(hintfile.RAIN, 0), counts.get(hintfile.SNOW, 0), counts.get(hintfile.MIXED, 0),
+            counts.get(hintfile.FREEZING_RAIN, 0), mean_cover))
         hours.append(file_name(valid)[:-4])
     status = {"format": hintfile.VERSION, "source": SOURCE, "run": stamp(run), "generated": stamp(generated), "hours": hours,
-              "atlases": [name for name, _ in atlases]}
+              "atlases": [name for name, _ in atlases], "clouds": hours}
     with open(os.path.join(arguments.site, "v1", "status.json"), "w", encoding="utf-8") as out:
         json.dump(status, out, indent=1)
     with open(os.path.join(arguments.site, "index.html"), "w", encoding="utf-8") as out:
