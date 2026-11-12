@@ -1,0 +1,70 @@
+# Builds the hint maps from the newest NOAA GFS run and publishes them with GitHub Pages.
+#
+# GFS runs start at 00, 06, 12 and 18 UTC and the hours this job needs reach NOAA's mirror about
+# 3 h 35 min to 3 h 55 min later. Each run gets three tries (the first may be early or delayed);
+# a try finds out from the published status.json whether that run is already out and then stops.
+# The times avoid the top of the hour, when GitHub delays or drops scheduled jobs most often.
+name: Publish
+
+on:
+  schedule:
+    - cron: "56 3,9,15,21 * * *"
+    - cron: "26 4,10,16,22 * * *"
+    - cron: "26 5,11,17,23 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write   # the monthly archive release
+  pages: write
+  id-token: write
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      changed: ${{ steps.build.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Test
+        run: python -I -m unittest discover -s tests
+      - name: Build
+        id: build
+        run: python -I hints.py live --site _site --atlases atlases --status-url "${STATUS_URL}"
+        env:
+          STATUS_URL: ${{ vars.STATUS_URL || 'https://data.nearestsky.com/v1/status.json' }}
+      - name: Archive
+        if: steps.build.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN: ${{ steps.build.outputs.run }}
+        run: |
+          tag="archive-${RUN:0:6}"
+          tar -czf "gfs-${RUN}.tar.gz" -C _site v1
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --title "Hint maps ${RUN:0:4}-${RUN:4:2}" \
+            --notes "Every published run of the month, one archive per run (GFS run time in the file name)."
+          gh release upload "$tag" "gfs-${RUN}.tar.gz" --clobber
+      - uses: actions/configure-pages@v6
+        if: steps.build.outputs.changed == 'true'
+      - uses: actions/upload-pages-artifact@v5
+        if: steps.build.outputs.changed == 'true'
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    if: needs.build.outputs.changed == 'true'
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
